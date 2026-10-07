@@ -4,7 +4,7 @@
 #include <nrf_soc.h>
 
 // ======================================================
-// KELVYN - TEMPERATURE + HUMIDITY TRANSMITTER
+// KELVYN - TEMPERATURE + HUMIDITY + BATTERY
 // XIAO nRF52840 + SHT40
 //
 // NO history
@@ -12,10 +12,24 @@
 // NO flash logging
 // NO Start/Stop commands
 //
-// Wake/read -> advertise -> iPhone connects ->
-// notify temperature + humidity -> disconnect ->
-// wait -> repeat
+// Wake/read:
+//   battery voltage
+//   temperature
+//   humidity
+//
+// advertise -> iPhone connects ->
+// notify all three values -> disconnect ->
+// low-power wait -> repeat
 // ======================================================
+
+
+// ------------------------------------------------------
+// XIAO BATTERY MONITOR
+// ------------------------------------------------------
+
+#define PIN_VBAT        32
+#define PIN_VBAT_ENABLE 14
+#define PIN_CHG         23
 
 
 // ------------------------------------------------------
@@ -61,6 +75,7 @@ volatile bool phoneConnected = false;
 
 float currentTemperatureC = 0.0;
 float currentHumidity = 0.0;
+float currentBatteryVoltage = 0.0;
 
 bool temperatureSent = false;
 
@@ -75,8 +90,7 @@ void lowPowerWait(unsigned long milliseconds) {
 
   while (millis() - start < milliseconds) {
 
-    // Puts CPU to sleep until an interrupt/event occurs.
-    // RTC/BLE interrupts wake it briefly.
+    // Sleep CPU until next interrupt/event.
     sd_app_evt_wait();
   }
 }
@@ -108,6 +122,40 @@ void disconnectCallback(
 
 
 // ======================================================
+// READ BATTERY
+// ======================================================
+
+float readBatteryVoltage() {
+
+  // LOW enables the XIAO battery measurement circuit.
+  digitalWrite(PIN_VBAT_ENABLE, LOW);
+
+  // Allow voltage divider / ADC input to settle.
+  delay(5);
+
+  // Throw away first ADC conversion after enabling.
+  analogRead(PIN_VBAT);
+
+  delay(1);
+
+  int vbatt = analogRead(PIN_VBAT);
+
+  // IMPORTANT:
+  // Turn battery measurement circuit OFF again.
+  // This prevents the divider from remaining enabled
+  // throughout the 5-minute sleep period.
+  digitalWrite(PIN_VBAT_ENABLE, HIGH);
+
+  // Preserve the calibration formula that was working
+  // in your current Arduino program.
+  float voltage =
+    2.961 * 3.6 * vbatt / 4096.0;
+
+  return voltage;
+}
+
+
+// ======================================================
 // READ TEMPERATURE + HUMIDITY
 // ======================================================
 
@@ -119,11 +167,15 @@ bool readEnvironment() {
   if (!sht4.getEvent(&humidity, &temp)) {
 
     Serial.println("SHT40 read failed.");
+
     return false;
   }
 
-  currentTemperatureC = temp.temperature;
-  currentHumidity = humidity.relative_humidity;
+  currentTemperatureC =
+    temp.temperature;
+
+  currentHumidity =
+    humidity.relative_humidity;
 
   float temperatureF =
     currentTemperatureC * 9.0 / 5.0 + 32.0;
@@ -144,7 +196,7 @@ bool readEnvironment() {
 
 
 // ======================================================
-// BUILD 4-BYTE ENVIRONMENT PACKET
+// BUILD 6-BYTE ENVIRONMENT PACKET
 //
 // Bytes 0-1:
 //   signed Int16
@@ -154,9 +206,15 @@ bool readEnvironment() {
 //   unsigned UInt16
 //   relative humidity % x 100
 //
-// Example:
-//   21.35 C -> 2135
-//   48.27 % -> 4827
+// Bytes 4-5:
+//   unsigned UInt16
+//   battery voltage in millivolts
+//
+// Examples:
+//
+//   21.35 C  -> 2135
+//   48.27 %  -> 4827
+//   3.87 V   -> 3870 mV
 // ======================================================
 
 void buildEnvironmentPacket(uint8_t *data) {
@@ -169,6 +227,11 @@ void buildEnvironmentPacket(uint8_t *data) {
   uint16_t humidity100 =
     (uint16_t)round(
       currentHumidity * 100.0
+    );
+
+  uint16_t batteryMV =
+    (uint16_t)round(
+      currentBatteryVoltage * 1000.0
     );
 
 
@@ -188,6 +251,15 @@ void buildEnvironmentPacket(uint8_t *data) {
 
   data[3] =
     (humidity100 >> 8) & 0xFF;
+
+
+  // Battery voltage
+
+  data[4] =
+    batteryMV & 0xFF;
+
+  data[5] =
+    (batteryMV >> 8) & 0xFF;
 }
 
 
@@ -197,13 +269,13 @@ void buildEnvironmentPacket(uint8_t *data) {
 
 void prepareEnvironmentCharacteristic() {
 
-  uint8_t data[4];
+  uint8_t data[6];
 
   buildEnvironmentPacket(data);
 
   temperatureCharacteristic.write(
     data,
-    4
+    6
   );
 }
 
@@ -225,8 +297,7 @@ void startAdvertising() {
 
   Bluefruit.Advertising.addTxPower();
 
-  // Advertise Kelvyn service so iOS can find it
-  // while the app is in the background.
+  // Important for iOS background discovery.
   Bluefruit.Advertising.addService(
     kelvynService
   );
@@ -237,9 +308,7 @@ void startAdvertising() {
     false
   );
 
-  // Advertising interval:
-  // 32  = 20 ms fast advertising
-  // 244 = 152.5 ms slower advertising
+  // 20 ms initially, then 152.5 ms.
   Bluefruit.Advertising.setInterval(
     32,
     244
@@ -278,8 +347,9 @@ void transmitEnvironment() {
 
       phoneConnected = true;
 
-      // Give iOS time to discover service,
+      // Give iOS time to discover the service,
       // characteristic and enable notifications.
+
       unsigned long connectionStart =
         millis();
 
@@ -293,17 +363,17 @@ void transmitEnvironment() {
             .notifyEnabled()
         ) {
 
-          uint8_t data[4];
+          uint8_t data[6];
 
           buildEnvironmentPacket(data);
 
           temperatureCharacteristic.notify(
             data,
-            4
+            6
           );
 
           Serial.println(
-            "*** TEMP + HUMIDITY SENT TO IPHONE ***"
+            "*** TEMP + HUMIDITY + BATTERY SENT TO IPHONE ***"
           );
 
           temperatureSent = true;
@@ -327,9 +397,7 @@ void transmitEnvironment() {
     sd_app_evt_wait();
   }
 
-
   Bluefruit.Advertising.stop();
-
 
   if (!temperatureSent) {
 
@@ -352,10 +420,25 @@ void setup() {
 
   delay(1000);
 
+  // ----------------------------------------------------
+  // Battery measurement
+  // ----------------------------------------------------
+
+  pinMode(PIN_VBAT, INPUT);
+  pinMode(PIN_VBAT_ENABLE, OUTPUT);
+  pinMode(PIN_CHG, INPUT);
+
+  // HIGH = battery measurement divider OFF.
+  digitalWrite(PIN_VBAT_ENABLE, HIGH);
+
+  analogReference(AR_DEFAULT);
+  analogReadResolution(12);
+
+
   Serial.println();
   Serial.println("==============================");
   Serial.println("       KELVYN SIMPLE BLE");
-  Serial.println("     TEMPERATURE + HUMIDITY");
+  Serial.println(" TEMP + HUMIDITY + BATTERY");
   Serial.println("==============================");
 
 
@@ -412,10 +495,11 @@ void setup() {
   // ----------------------------------------------------
   // Environment characteristic
   //
-  // 4 bytes total:
+  // 6 bytes total:
   //
   // Bytes 0-1 = signed temperature C x 100
   // Bytes 2-3 = unsigned RH % x 100
+  // Bytes 4-5 = unsigned battery millivolts
   // ----------------------------------------------------
 
   temperatureCharacteristic.setProperties(
@@ -428,10 +512,9 @@ void setup() {
     SECMODE_NO_ACCESS
   );
 
-  temperatureCharacteristic.setFixedLen(4);
+  temperatureCharacteristic.setFixedLen(6);
 
   temperatureCharacteristic.begin();
-
 
   Serial.println("BLE ready.");
 }
@@ -445,6 +528,33 @@ void loop() {
 
   Serial.println();
   Serial.println("----- NEW READING -----");
+
+
+  // ----------------------------------------------------
+  // BATTERY
+  // ----------------------------------------------------
+
+  currentBatteryVoltage =
+    readBatteryVoltage();
+
+  int charging =
+    digitalRead(PIN_CHG);
+
+  Serial.print("Voltage: ");
+  Serial.print(currentBatteryVoltage, 3);
+
+  Serial.print(" V | Charging: ");
+
+  Serial.println(
+    charging == 0
+      ? "Yes"
+      : "No"
+  );
+
+
+  // ----------------------------------------------------
+  // TEMPERATURE + HUMIDITY
+  // ----------------------------------------------------
 
   if (readEnvironment()) {
 
@@ -460,6 +570,9 @@ void loop() {
   );
   Serial.println(" seconds...");
   Serial.println();
+
+
+  // Battery measurement circuit is already OFF here.
 
   lowPowerWait(
     SAMPLE_INTERVAL_MS
